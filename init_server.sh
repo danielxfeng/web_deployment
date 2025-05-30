@@ -1,60 +1,17 @@
 #!/bin/bash
 
-# This script is to initialize a web server.
-# - It installs Docker and docker-compose-plugin.
-# - It sets up SSH with a custom port and adds a public key for CI/CD.
-# - It configures a firewall with UFW.
-# - It disables root login and password authentication for SSH.
-
-# Required .env variables:
-# - CICD_PUB_KEY: SSH public key for CI/CD access
-# - SSH_PORT: Custom SSH port (1024-65535)
+# This script runs on the server side, to initialize a web server.
+# - Updates the system, installs necessary packages.
+# - Installs Docker and docker-compose-plugin.
+# - Adds a new user.
+# - Copies SSH keys and SSL certificates.
+# - Install and configures Tailscale.
+# - Configures a firewall with UFW.
+# - Disables root login and password authentication for SSH.
 
 set -euo pipefail  # Exit on error
 
-#----------- Setup logging
-LOG_FILE="/var/log/server-init.log"
-exec 1> >(tee -a "$LOG_FILE") 2>&1
-
 echo "Cool, let's initialize the server..."
-
-#----------- Parsing and error handling
-if [[ ! -f ".env" ]]; then
-  echo "ERROR: .env file not found."
-  exit 1
-fi
-
-source .env  # Load environment variables
-
-# Validate environment variables
-if [[ -z "${CICD_PUB_KEY:-}" ]]; then
-    echo "ERROR: CICD_PUB_KEY not set in .env"
-    exit 1
-fi
-
-# Validate CICD_PUB_KEY format
-if [[ -z "${SSH_PORT:-}" ]]; then
-    echo "ERROR: SSH_PORT not set in .env"
-    exit 1
-fi
-
-# Validate SSH port range
-if [[ "$SSH_PORT" -lt 1024 || "$SSH_PORT" -gt 65535 ]]; then
-    echo "ERROR: SSH_PORT must be between 1024-65535"
-    exit 1
-fi
-
-# Validate SSH key format
-if ! echo "$CICD_PUB_KEY" | ssh-keygen -l -f - &>/dev/null; then
-    echo "ERROR: Invalid SSH public key format"
-    exit 1
-fi
-
-# Check idempotency
-if [[ -f "/var/log/server-init-complete" ]]; then
-  echo "Server appears to already be initialized."
-  [[ "${1:-}" != "--force" ]] && exit 0
-fi
 
 #----------- Update and install dependencies
 echo "The system is updating, if restarted, please run this script again."
@@ -77,45 +34,64 @@ else
   echo "docker-compose-plugin already installed, skipping."
 fi
 
-# Add current user to docker group
-if ! groups $USER | grep -q docker; then
-  echo "Adding user to docker group..."
-  sudo usermod -aG docker $USER
-  echo "Note: You'll need to log out and back in for docker group changes to take effect"
+#----------- Parsing and error handling -----------------
+if [[ ! -f "$HOME/tmp/.env" ]]; then
+  echo "ERROR: .env file not found."
+  exit 1
 fi
 
-#----------- SSH hardening
+source "$HOME/tmp/.env"  # Load environment variables
 
-# SSH key setup
-mkdir -p ~/.ssh
-chmod 700 ~/.ssh
+# Check existence of required files
 
-# Ensure authorized_keys file exists
-touch ~/.ssh/authorized_keys
-chmod 600 ~/.ssh/authorized_keys
-
-# Add CI/CD public key
-if ! grep -Fxq "$CICD_PUB_KEY" ~/.ssh/authorized_keys 2>/dev/null; then
-    echo "$CICD_PUB_KEY" >> ~/.ssh/authorized_keys
-    echo "Added CI/CD public key"
-else
-    echo "CI/CD public key already exists"
-fi
-
-# Backup SSH config before modifying
-BACKUP_FILE="/etc/ssh/sshd_config.backup.$(date +%Y%m%d_%H%M%S)"
-sudo cp /etc/ssh/sshd_config "$BACKUP_FILE"
-
-# Rollback function for SSH configuration
-rollback_ssh() {
-    if [[ -n "${BACKUP_FILE:-}" && -f "$BACKUP_FILE" ]]; then
-        echo "Rolling back SSH configuration..."
-        sudo cp "$BACKUP_FILE" /etc/ssh/sshd_config
-        sudo systemctl restart sshd
-    fi
+check_file() {
+  local file=$1
+  if [[ ! -f "$file" ]]; then
+    echo "ERROR: Required file $file not found."
+    exit 1
+  fi
 }
 
-trap 'echo "ERROR: Script failed at line $LINENO"; rollback_ssh; exit 1' ERR
+check_file "$HOME/tmp/.env"
+check_file "$HOME/tmp/authorized_keys"
+check_file "$HOME/tmp/origin-key.pem"
+check_file "$HOME/tmp/origin-cert.pem"
+check_file "$HOME/tmp/default.conf"
+check_file "$HOME/tmp/docker-compose.yml"
+
+#----------- Add a new user -----------------
+echo "Creating new user: $NEW_USER"
+
+if id "$NEW_USER" &>/dev/null; then
+  echo "User $NEW_USER already exists. Skipping user creation."
+else
+  sudo adduser --disabled-password --gecos "" "$NEW_USER"
+  sudo usermod -aG sudo "$NEW_USER"
+  sudo usermod -aG docker "$NEW_USER"
+  echo "User $NEW_USER created and added to sudo, and docker group."
+fi
+
+#----------- Copy SSH keys and SSL certificates -----------------
+echo "Copying SSH keys and SSL certificates..."
+sudo mkdir -p /etc/ssl/certs
+sudo chmod 755 /etc/ssl/certs
+sudo cp $HOME/tmp/origin-key.pem /etc/ssl/certs/origin-key.pem
+sudo cp $HOME/tmp/origin-cert.pem /etc/ssl/certs/origin-cert.pem
+sudo chmod 600 /etc/ssl/certs/origin-key.pem
+sudo chmod 644 /etc/ssl/certs/origin-cert.pem
+# Copy authorized_keys to the new user's .ssh directory
+sudo mkdir -p /home/$NEW_USER/.ssh
+sudo cp $HOME/tmp/authorized_keys /home/$NEW_USER/.ssh/authorized_keys
+sudo chmod 600 /home/$NEW_USER/.ssh/authorized_keys
+sudo chown -R $NEW_USER:$NEW_USER /home/$NEW_USER/.ssh
+# Set permissions for the new user's .ssh directory
+sudo chmod 700 /home/$NEW_USER/.ssh
+# Set permissions for the new user's home directory
+sudo chmod 755 /home/$NEW_USER
+# Set ownership for the new user's home directory
+sudo chown $NEW_USER:$NEW_USER /home/$NEW_USER
+
+#----------- SSH hardening------------------
 
 # Harden SSH configuration
 update_ssh_config() {
@@ -129,57 +105,58 @@ update_ssh_config() {
 }
 
 echo "Performing SSH configuration..."
-update_ssh_config "Port" "$SSH_PORT"
 update_ssh_config "PermitRootLogin" "no"
 update_ssh_config "PasswordAuthentication" "no"
 
 # Validate SSH config before restart
 if ! sudo sshd -t; then
-    echo "ERROR: SSH configuration is invalid. Restoring backup..."
-    sudo cp "$BACKUP_FILE" /etc/ssh/sshd_config
+    echo "ERROR: SSH configuration is invalid."
     exit 1
 fi
 
-sudo systemctl restart sshd
-
 # Verify after restart as well
 if sudo sshd -t; then
-    echo "SSH configuration validated successfully"
+  echo "SSH configuration validated successfully, restarting sshd..."
+  sudo systemctl restart sshd
 else
-    echo "WARNING: SSH config validation failed after restart"
+  echo "ERROR: SSH configuration invalid, aborting."
+  exit 1
 fi
+
+#----------- Install & start Tailscale ----------------
+if ! command -v tailscale &>/dev/null; then
+  echo "Installing Tailscale..."
+  curl -fsSL https://tailscale.com/install.sh | sh
+fi
+
+echo "Authenticating Tailscale..."
+sudo tailscale up --authkey "$TAILSCALE_AUTH_KEY" --ssh
 
 # ------------ Firewall configuration
 
 # Harden UFW firewall
-echo "Enabling UFW firewall..., do not forget to disable 22 port when $SSH_PORT works"
+echo "Enabling UFW firewall..."
 sudo ufw --force reset
 sudo ufw default deny incoming
 sudo ufw default allow outgoing
-sudo ufw allow $SSH_PORT/tcp comment "Custom SSH"
-sudo ufw allow 22/tcp comment "Default SSH (remove after testing)"
+sudo ufw allow 41641/udp comment "Tailscale direct UDP"
+sudo ufw allow in on lo
+sudo ufw allow in on tailscale0
+sudo ufw allow ${INIT_SSH_PORT}/tcp comment "SSH on port $INIT_SSH_PORT"
 sudo ufw allow 443/tcp comment "HTTPS"
-sudo ufw allow 80/tcp comment "HTTP"
 sudo ufw --force enable
 
 # UFW status display
 echo "Current UFW status:"
 sudo ufw status numbered
 
-# Test SSH port availability
-echo "Testing SSH connectivity on port $SSH_PORT..."
-if timeout 5 nc -z localhost "$SSH_PORT"; then
-    echo "SSH port $SSH_PORT is reachable locally"
-    if sudo ufw status | grep -q "22/tcp"; then
-        sudo ufw delete allow 22/tcp
-        echo "Disabled default SSH port 22"
-    fi
-else
-    echo "WARNING: Cannot connect to SSH port $SSH_PORT locally"
-    echo "Keeping port 22 open for safety"
-fi
+#----------- Start Nginx -----------------
+echo "Starting Nginx..."
+sudo mkdir -p /etc/nginx/conf.d
+sudo cp $HOME/tmp/default.conf /etc/nginx/conf.d/default.conf
+sudo mkdir -p /home/$NEW_USER/${PROJECT_PATH}
+sudo cp $HOME/tmp/docker-compose.yml /home/$NEW_USER/${PROJECT_PATH}/docker-compose.yml
+sudo chown $NEW_USER:$NEW_USER /home/$NEW_USER/${PROJECT_PATH}/docker-compose.yml
+sudo -u $NEW_USER docker compose -f /home/$NEW_USER/${PROJECT_PATH}/docker-compose.yml up -d
 
-# Mark initialization complete
-sudo touch /var/log/server-init-complete
-
-echo "Cool, everything is done. You can now test your new SSH port $SSH_PORT."
+echo "Cool, everything is done. You can now do the testing."
