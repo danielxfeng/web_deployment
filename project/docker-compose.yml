@@ -1,4 +1,3 @@
-version: '3.9'
 services:
   nginx:
     image: nginx:latest
@@ -8,3 +7,8 @@ services:
     volumes:
       - /etc/nginx/conf.d:/etc/nginx/conf.d
       - /etc/ssl/certs:/etc/ssl/certs
+    networks:
+      - web_net
+
+networks:
+  web_net:
